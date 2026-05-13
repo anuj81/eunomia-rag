@@ -1,13 +1,22 @@
 """OpenMetadata REST source for the indexer.
 
 Returns a list of normalized "table descriptors" (dicts) shaped for the doc
-synthesizer. Same login flow as eunomia-middleware's catalog client.
+synthesizer.
+
+Auth strategy:
+    1. Phase D / preferred — Keycloak `client_credentials` grant.
+       Requires settings.keycloak.client_id + client_secret. Token has the
+       `eunomia-om-admin` realm role (set on the service-account user) so OM
+       grants full read access.
+    2. Legacy fallback — OpenMetadata `/users/login` with username/password.
+       Used only if Keycloak config is missing.
 """
 
 from __future__ import annotations
 
 import base64
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -26,18 +35,71 @@ class OpenMetadataSource:
         self._username = cfg.username
         self._password = cfg.password
         self._database_fqn = cfg.database_fqn
+
+        kc = settings.keycloak
+        self._kc_token_endpoint = kc.issuer.rstrip("/") + "/protocol/openid-connect/token"
+        self._kc_client_id = kc.client_id
+        self._kc_client_secret = kc.client_secret
+        self._kc_refresh_window = kc.refresh_window_seconds
+
         self._token: Optional[str] = None
+        self._token_expires_at: float = 0.0
         self._session = requests.Session()
 
     # --------------------------------------------------------------- auth #
 
     def _login(self) -> None:
-        if self._token is not None:
+        """Acquire (or refresh) an access token.
+
+        Phase D path: Keycloak `client_credentials` grant.
+        Legacy path:  OM basic-auth.
+
+        Cached for the token's lifetime minus a refresh window.
+        """
+        # Cached and still fresh?
+        if self._token and time.time() < self._token_expires_at - self._kc_refresh_window:
             return
+
+        if self._kc_client_secret:
+            self._login_via_keycloak()
+            return
+
+        # Legacy fallback — only meaningful if OM is in `basic` or `multi`.
+        self._login_via_om_basic()
+
+    def _login_via_keycloak(self) -> None:
+        try:
+            resp = self._session.post(
+                self._kc_token_endpoint,
+                data={
+                    "client_id":     self._kc_client_id,
+                    "client_secret": self._kc_client_secret,
+                    "grant_type":    "client_credentials",
+                },
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                logger.error(
+                    "Keycloak client_credentials grant failed: %s %s",
+                    resp.status_code, resp.text[:200],
+                )
+                return
+            body = resp.json()
+            self._token = body.get("access_token")
+            # `expires_in` is seconds-until-expiry from now.
+            self._token_expires_at = time.time() + int(body.get("expires_in", 60))
+            logger.info(
+                "Keycloak token acquired for client_id=%s (expires_in=%ss)",
+                self._kc_client_id, body.get("expires_in"),
+            )
+        except Exception:
+            logger.exception("Keycloak client_credentials grant raised")
+
+    def _login_via_om_basic(self) -> None:
         if not self._password:
             logger.warning(
-                "openmetadata.password not set (OPENMETADATA_PASSWORD). "
-                "Indexer requests will likely 401."
+                "Neither KEYCLOAK_RAG_INDEXER_SECRET nor OPENMETADATA_PASSWORD "
+                "is set — OM requests will 401."
             )
             return
         try:
@@ -49,14 +111,19 @@ class OpenMetadataSource:
             )
             if resp.status_code == 200:
                 self._token = resp.json().get("accessToken")
-                logger.info("OpenMetadata login succeeded as %s", self._username)
+                # OM tokens default to ~24h; set a conservative cache TTL.
+                self._token_expires_at = time.time() + 3600
+                logger.info(
+                    "OpenMetadata basic-login succeeded as %s (legacy path)",
+                    self._username,
+                )
             else:
                 logger.error(
-                    "OpenMetadata login failed: %s %s",
+                    "OpenMetadata basic-login failed: %s %s",
                     resp.status_code, resp.text[:200],
                 )
         except Exception:
-            logger.exception("OpenMetadata login raised")
+            logger.exception("OpenMetadata basic-login raised")
 
     def _headers(self) -> Dict[str, str]:
         self._login()
@@ -124,7 +191,13 @@ class OpenMetadataSource:
 
 
 def _normalize_table(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Pick the few fields we care about; flatten owners/domains.
+    """Pick the few fields we care about; flatten owners/domains + PII tags.
+
+    Phase D additions:
+        • `pii_columns` — list of column names tagged `PII.Sensitive`.
+        • Per-column `tags` list — preserved on each column for downstream
+          consumers (e.g. middleware reading PII sidecar from RAG retrieve
+          payload — wired in #23 part 2).
 
     OM 1.x returns:
         owners:  list of EntityReference dicts (may be empty)
@@ -132,7 +205,7 @@ def _normalize_table(raw: Dict[str, Any]) -> Dict[str, Any]:
     Older code paths used singular `domain` (an object) and `owner` — we
     accept both for forward/backward compatibility.
     """
-    # Owners: prefer first entry's name; both shapes seen in the wild.
+    # Owners
     owners = raw.get("owners")
     if isinstance(owners, list) and owners:
         owner_name = owners[0].get("name")
@@ -141,7 +214,7 @@ def _normalize_table(raw: Dict[str, Any]) -> Dict[str, Any]:
     else:
         owner_name = None
 
-    # Domain: same dual-shape tolerance.
+    # Domain
     domains = raw.get("domains")
     if isinstance(domains, list) and domains:
         domain_name = domains[0].get("name")
@@ -150,15 +223,22 @@ def _normalize_table(raw: Dict[str, Any]) -> Dict[str, Any]:
     else:
         domain_name = None
 
-    columns: List[Dict[str, str]] = []
+    columns: List[Dict[str, Any]] = []
+    pii_columns: List[str] = []
     for c in raw.get("columns") or []:
         name = c.get("name")
         if not name:
             continue
+        tag_fqns = [t.get("tagFQN") for t in (c.get("tags") or []) if t.get("tagFQN")]
+        is_pii = any(t == "PII.Sensitive" for t in tag_fqns)
+        if is_pii:
+            pii_columns.append(name)
         columns.append({
             "name": name,
             "description": (c.get("description") or "").strip(),
             "data_type": (c.get("dataType") or c.get("dataTypeDisplay") or ""),
+            "tags": tag_fqns,
+            "is_pii": is_pii,
         })
 
     return {
@@ -168,4 +248,5 @@ def _normalize_table(raw: Dict[str, Any]) -> Dict[str, Any]:
         "domain": domain_name,
         "owner_team": owner_name,
         "columns": columns,
+        "pii_columns": pii_columns,
     }

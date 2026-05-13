@@ -57,9 +57,29 @@ class ServerConfig(BaseModel):
 
 class OpenMetadataConfig(BaseModel):
     url: str = "http://localhost:8585/api/v1"
+    # username/password are LEGACY — used only if keycloak block is unset OR
+    # if the indexer is run against an OM in `basic` auth mode. With OM in
+    # custom-oidc (Phase D), the Keycloak service-account flow is used instead.
     username: str = "admin@open-metadata.org"
     database_fqn: str = "zenith_mysql.zenith_corp_eunomia.zenith_corp_eunomia"
-    password: Optional[str] = None  # env-only
+    password: Optional[str] = None  # env-only (legacy)
+
+
+class KeycloakConfig(BaseModel):
+    """Indexer auth via Keycloak client_credentials grant.
+
+    When this block is populated (issuer + client_id + client_secret), the
+    indexer obtains an access token from Keycloak and forwards it to OM as
+    Bearer auth. The service account user holds eunomia-om-admin in our
+    realm-export.json, so OM grants the indexer full read access.
+    """
+
+    issuer: str = "http://localhost:8080/realms/eunomia"
+    client_id: str = "eunomia-rag-indexer"
+    # client_secret comes from env (KEYCLOAK_RAG_INDEXER_SECRET).
+    client_secret: Optional[str] = None  # env-only
+    # Token grant cache TTL — we re-request slightly before token expiry.
+    refresh_window_seconds: int = 30
 
 
 class QdrantConfig(BaseModel):
@@ -97,6 +117,7 @@ class Settings(BaseSettings):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
     openmetadata: OpenMetadataConfig = Field(default_factory=OpenMetadataConfig)
+    keycloak: KeycloakConfig = Field(default_factory=KeycloakConfig)
     qdrant: QdrantConfig = Field(default_factory=QdrantConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
@@ -113,12 +134,14 @@ class SecretInYamlError(ValueError):
 
 _FORBIDDEN_YAML_SECRETS: Tuple[Tuple[str, str], ...] = (
     ("openmetadata", "password"),
-    ("auth", "api_key"),
+    ("keycloak",     "client_secret"),
+    ("auth",         "api_key"),
 )
 
 _WELL_KNOWN_SECRET_ENV: Dict[str, Tuple[str, str]] = {
-    "OPENMETADATA_PASSWORD": ("openmetadata", "password"),
-    "RAG_API_KEY": ("auth", "api_key"),
+    "OPENMETADATA_PASSWORD":         ("openmetadata", "password"),
+    "KEYCLOAK_RAG_INDEXER_SECRET":   ("keycloak",     "client_secret"),
+    "RAG_API_KEY":                   ("auth",         "api_key"),
 }
 
 
