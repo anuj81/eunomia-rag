@@ -1,0 +1,51 @@
+# Eunomia RAG service — default configuration.
+#
+# Precedence (highest wins):
+#   1. CLI flags          (e.g. --verbose DEBUG, --config path)
+#   2. Environment vars   (EUNOMIA_RAG_<SECTION>__<FIELD>, or short names below)
+#   3. This YAML file
+#   4. Built-in defaults
+#
+# Secrets MUST NOT live here. Use environment variables:
+#   OPENMETADATA_PASSWORD — for the indexer to log into OM
+#   RAG_API_KEY           — bearer token clients present to this service
+
+logging:
+  level: INFO                   # DEBUG | INFO | WARN | ERROR
+  log_dir: ./logs
+  console: true
+  file: true
+  rotation:
+    max_bytes: 10485760
+    backup_count: 5
+
+server:
+  host: 0.0.0.0
+  port: 9000
+  reload: true
+
+# OpenMetadata source for the indexer
+openmetadata:
+  url: http://localhost:8585/api/v1
+  username: admin@open-metadata.org
+  database_fqn: zenith_mysql.zenith_corp_eunomia.zenith_corp_eunomia
+  # password: <env-only — see OPENMETADATA_PASSWORD>
+
+# Qdrant vector store
+qdrant:
+  url: http://localhost:6333
+  collection: eunomia_views
+  vector_size: 384              # all-MiniLM-L6-v2 output dim
+  distance: Cosine              # Cosine | Dot | Euclid
+
+# Embeddings
+embedding:
+  model: sentence-transformers/all-MiniLM-L6-v2
+  # If true, the encoder loads at startup (longer boot, faster first request).
+  # If false, the model is lazy-loaded on first /v1/retrieve call.
+  preload: true
+
+# API auth
+auth:
+  require_auth: true            # set false in dev to skip bearer checks
+  # api_key: <env-only — see RAG_API_KEY>

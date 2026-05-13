@@ -1,0 +1,30 @@
+# Secrets
+.env
+.env.local
+
+# Per-developer config overrides
+config/eunomia-rag.local.yaml
+
+# Log output
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenv
+venv/
+.venv/
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+
+# Sentence-transformers model cache (multi-GB) — keep out of repo
+.cache/
