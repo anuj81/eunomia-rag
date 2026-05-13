@@ -27,9 +27,17 @@ server:
 # OpenMetadata source for the indexer
 openmetadata:
   url: http://localhost:8585/api/v1
-  username: admin@open-metadata.org
+  username: admin@open-metadata.org          # legacy basic-auth path (only if keycloak block is unset)
   database_fqn: zenith_mysql.zenith_corp_eunomia.zenith_corp_eunomia
-  # password: <env-only — see OPENMETADATA_PASSWORD>
+  # password: <env-only — see OPENMETADATA_PASSWORD> — legacy
+
+# Indexer auth via Keycloak service account (client_credentials grant).
+# Preferred over openmetadata.username/password when OM is in custom-oidc mode.
+keycloak:
+  issuer: http://localhost:8080/realms/eunomia
+  client_id: eunomia-rag-indexer
+  # client_secret: <env-only — see KEYCLOAK_RAG_INDEXER_SECRET>
+  refresh_window_seconds: 30                  # re-request token this many seconds before expiry
 
 # Qdrant vector store
 qdrant:
